@@ -1,0 +1,15 @@
+# Runtimes and Packages
+.venv/
+__pycache__/
+*.pyc
+
+# Testing and Development IDEs
+.pytest_cache/
+.coverage
+.idea/
+.vscode/
+
+# Alexandria Database / Local Storage
+# (Prevents local binary data tables from being pushed to GitHub)
+.lancedb/
+data/
