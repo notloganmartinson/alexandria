@@ -5,12 +5,11 @@ import shutil
 import asyncio
 from datasets import Dataset
 from ragas import evaluate
-from ragas.metrics.collections import ContextPrecision, ContextRecall  # Fixed warning here
-from ragas.llms import LangchainLLMWrapper
-from langchain_openai import ChatOpenAI
-from alexandria.storage.vault import AlexandriaVault  # Fixed src error here
-from alexandria.retriever import HybridRetriever  # Fixed src error here
-
+from ragas.metrics.collections import ContextPrecision, ContextRecall
+from ragas.llms import llm_factory 
+from openai import OpenAI
+from alexandria.storage.vault import AlexandriaVault
+from alexandria.retriever import HybridRetriever
 
 TEST_VAULT_DIR = "./.test_system_hybrid_vault"
 
@@ -91,6 +90,22 @@ async def test_multi_hop_fusion_retrieval(operational_vault):
     # Verify that RRF successfully pulled the un-indexed multi-hop chunk via graph connections
     assert "spending freeze" in context_output.lower(), "RRF failed to surface the multi-hop graph connection."
 
+    # 1. Point the native OpenAI client to your local llama.cpp server
+    openai_client = OpenAI(
+        api_key="not-needed",
+        base_url="http://localhost:8082/v1"
+    )
+    
+    # 2. Use the new Ragas llm_factory to create the InstructorLLM
+    evaluator_llm = llm_factory(
+        "qwen2.5-coder-7b-instruct", 
+        client=openai_client
+    )
+
+        # 3. Pass the wrapped Judge to the Metrics
+    precision_metric = ContextPrecision(llm=evaluator_llm)
+    recall_metric = ContextRecall(llm=evaluator_llm)
+
     # Execute LLM-as-a-judge precision tracking sweeps via Ragas
     eval_dataset = Dataset.from_dict({
         "question": [query],
@@ -99,8 +114,11 @@ async def test_multi_hop_fusion_retrieval(operational_vault):
         "answer": [""] # Isolated strictly to retrieval profiling
     })
     
-    eval_metrics = evaluate(dataset=eval_dataset, metrics=[ContextPrecision(), ContextRecall()])
-
+    eval_metrics = evaluate(
+        dataset=eval_dataset, 
+        metrics=[precision_metric, recall_metric]
+    )
+    
     print("\n==========================================")
     print("      ALEXANDRIA HYBRID RAG BENCHMARK      ")
     print("==========================================")
