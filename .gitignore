@@ -14,3 +14,11 @@ __pycache__/
 # (Prevents local binary data tables from being pushed to GitHub)
 .lancedb/
 data/
+# Python Build Artifacts
+build/
+dist/
+*.egg-info/
+
+# Alexandria Test Vaults
+.test_system_hybrid_vault/
+
