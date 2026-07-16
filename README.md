@@ -22,3 +22,10 @@ To run the integration tests and the RRF benchmark:
 ```bash
 # Load environment variables (e.g., OPENROUTER_API_KEY) and run the suite
 uv run pytest -v -s
+
+## Roadmap & Architecture
+
+Alexandria is in active development. Current focus areas include:
+* **Robust Chunking:** Moving from arbitrary text slicing to rigorous recursive character chunking to ensure zero data loss during ingestion.
+* **Scalable Graph I/O:** Migrating away from in-memory NetworkX pickling to a dedicated edge-store (SQLite/LanceDB) to support massive, 10,000+ node graphs without I/O bottlenecks.
+* **Entity Resolution:** Implementing fuzzy-matching to merge duplicate concepts (e.g., "Nvidia" vs. "NVIDIA Corp") during graph construction.
