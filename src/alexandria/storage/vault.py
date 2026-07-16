@@ -32,7 +32,7 @@ class AlexandriaVault:
         # Embeddings configurations (Vector array must map exactly to dimension bounds)
         # We extend the schema with a 384-dimension vector field for embeddings models
         self.extended_schema = pa.schema(
-            list(self.arrow_schema) + [pa.field("vector", pa.list_(pa.float32(), 384))]
+            list(self.arrow_schema) + [pa.field("vector", pa.list_(pa.float32(), 768))]
         )
         
         if self.table_name not in self.db.list_tables():
@@ -51,7 +51,7 @@ class AlexandriaVault:
         else:
             self.graph = nx.DiGraph()
 
-    def _save_graph(self):
+    def _sync_save_graph(self):
         with open(self.graph_path, 'wb') as f:
             pickle.dump(self.graph, f)
 
@@ -89,10 +89,10 @@ class AlexandriaVault:
                         
                         self.graph.add_edge(src, tgt, relation=edge_type)
                         
-                self._save_graph()
+                await asyncio.to_thread(self._sync_save_graph) 
                 return True
             except Exception as e:
-                # Keep errors isolated to trace ETL system corruptions
+                print(f"Ingestion Error: {e}")
                 return False
 
     async def hybrid_vector_search(self, query_vector: List[float], top_k: int = 15) -> List[Dict[str, Any]]:

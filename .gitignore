@@ -1,3 +1,4 @@
+.env
 # Runtimes and Packages
 .venv/
 __pycache__/
