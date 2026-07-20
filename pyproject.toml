@@ -16,6 +16,8 @@ dependencies = [
     "ragas>=0.4.3",
     "sentence-transformers>=5.6.0",
     "trafilatura>=2.1.0",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-language-pack>=1.13.2",
 ]
 
 [dependency-groups]
@@ -28,6 +30,7 @@ dev = [
     "pandas>=3.0.3",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-mock>=3.15.1",
     "ragas>=0.4.3",
     "ruff>=0.15.21",
 ]

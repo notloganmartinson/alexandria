@@ -1,12 +1,9 @@
-# src/alexandria/storage/vault.py
 import os
 import pickle
 import asyncio
 import lancedb
-import pyarrow as pa
 import networkx as nx
 from typing import List, Dict, Any, Optional
-from lancedb.pydantic import LanceModel, pydantic_to_schema
 from alexandria.storage.schemas import IngestionDocumentRecord
 
 class AlexandriaVault:
@@ -26,17 +23,10 @@ class AlexandriaVault:
         self.db = lancedb.connect(os.path.join(self.storage_path, "lancedb"))
         self.table_name = "vault_records"
         
-        # Derive schema directly from our production Pydantic layout
-        self.arrow_schema = pydantic_to_schema(IngestionDocumentRecord)
-        
-        # Embeddings configurations (Vector array must map exactly to dimension bounds)
-        # We extend the schema with a 384-dimension vector field for embeddings models
-        self.extended_schema = pa.schema(
-            list(self.arrow_schema) + [pa.field("vector", pa.list_(pa.float32(), 768))]
-        )
-        
-        if self.table_name not in self.db.list_tables():
-            self.table = self.db.create_table(self.table_name, schema=self.extended_schema)
+        # Initialize LanceDB table directly from our Pydantic LanceModel
+        # This automatically handles the 384-dimensional vector field definition
+        if self.table_name not in self.db.table_names():
+            self.table = self.db.create_table(self.table_name, schema=IngestionDocumentRecord)
         else:
             self.table = self.db.open_table(self.table_name)
             
@@ -58,7 +48,7 @@ class AlexandriaVault:
     async def write_records(self, records: List[Dict[str, Any]]) -> bool:
         """
         Thread-safe ingestion pipeline. 
-        Accepts records matching the schema extended with a 'vector' array.
+        Accepts records matching the IngestionDocumentRecord LanceModel schema.
         """
         async with self._lock:
             try:

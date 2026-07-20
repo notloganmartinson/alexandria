@@ -1,289 +1,206 @@
-# src/alexandria/extraction.py
-import asyncio
-import hashlib
-import logging
+"""
+Alexandria Extraction & Chunking Engine
+
+This module serves as the primary dispatcher for processing incoming documents.
+It inspects file extensions and routes them to the optimal semantic chunker:
+1. AST-aware chunking for code (preserves functions/classes).
+2. Hierarchical chunking for documentation (Markdown).
+3. Recursive character fallback for unknown types.
+"""
+
+import pathlib
 import re
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import List, Optional, Set
+import logging
+from typing import List, Dict, Any, Optional
 
-import httpx
-import trafilatura
+# Attempt to load the pre-compiled tree-sitter wheels
+try:
+    from tree_sitter_language_pack import get_parser
+    TREE_SITTER_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_AVAILABLE = False
+    logging.warning("tree_sitter_languages not found. Code chunking will degrade to fallback.")
 
-# Conforms to library logging standard
-logger = logging.getLogger("alexandria.extraction")
+logger = logging.getLogger(__name__)
 
+class RoutingChunker:
+    def __init__(self, fallback_chunk_size: int = 1000, fallback_overlap: int = 200):
+        self.fallback_chunk_size = fallback_chunk_size
+        self.fallback_overlap = fallback_overlap
 
-@dataclass(frozen=True)
-class ProvenanceManifest:
-    """
-    Data layout strictly aligning with Phase 1 LanceDB source_registry schema requirements.
-    Establishes cryptographically verifiable provenance for extracted knowledge nodes.
-    """
-    source_id: str
-    source_uri: str
-    raw_text_hash: str
-    harvest_timestamp: int  # Fixed: Aligns perfectly with pa.int64() Unix epoch milestones
-    total_nodes_generated: int = 0
-    raptor_compilation_state: bool = False  # Fixed: Aligns perfectly with pa.bool_() layouts
-
-
-@dataclass(frozen=True)
-class ExtractedDocument:
-    """Immutable data structure representing a successfully harvested and processed web document."""
-    url: str
-    markdown_content: str
-    manifest: ProvenanceManifest
-
-
-@dataclass(frozen=True)
-class EvaluationResult:
-    """Data structure encapsulating the algorithmic quality score of extracted text."""
-    is_valid: bool
-    signal_score: float
-    rejection_reason: Optional[str]
-
-
-class DensityEvaluator:
-    """
-    Signal-to-Noise Lexical Density Evaluator.
-    Executes heavy string manipulation and regex targeting to compute an internal technical 
-    signal score. Discards CAPTCHAs, cookie banners, and low-density shell pages.
-    """
-
-    def __init__(self) -> None:
-        self.minimum_word_count: int = 75
-        self.minimum_lexical_variety: float = 0.35
-        self.rejection_patterns: List[re.Pattern[str]] = [
-            re.compile(r"(?i)enable javascript to view"),
-            re.compile(r"(?i)please verify you are human"),
-            re.compile(r"(?i)checking your browser before accessing"),
-            re.compile(r"(?i)access denied \- security check"),
-            re.compile(r"(?i)accept all cookies"),
-            re.compile(r"(?i)captcha challenge"),
-        ]
-        self.code_block_pattern = re.compile(r"```[\s\S]*?```")
-
-    def _sync_evaluate(self, text: str) -> EvaluationResult:
-        """Synchronous evaluation core designed to run inside an isolated thread pool."""
-        if not text or not text.strip():
-            return EvaluationResult(False, 0.0, "Empty content payload")
-
-        for pattern in self.rejection_patterns:
-            if pattern.search(text):
-                return EvaluationResult(False, 0.0, "Matched malicious or blocking pattern (CAPTCHA/JS-gate)")
-
-        words = text.split()
-        word_count = len(words)
-        if word_count < self.minimum_word_count:
-            return EvaluationResult(False, 0.0, f"Low word count ({word_count} < {self.minimum_word_count})")
-
-        unique_words = set(w.lower() for w in words)
-        lexical_variety = len(unique_words) / word_count
-        if lexical_variety < self.minimum_lexical_variety:
-            return EvaluationResult(False, lexical_variety, f"Low lexical variety ({lexical_variety:.2f})")
-
-        code_blocks = self.code_block_pattern.findall(text)
-        code_char_count = sum(len(block) for block in code_blocks)
-        total_char_count = len(text)
-        
-        # Documents with high code density get a signal boost in a technical library
-        code_ratio = code_char_count / total_char_count if total_char_count > 0 else 0
-        signal_score = min(1.0, lexical_variety + (code_ratio * 0.5))
-
-        return EvaluationResult(True, signal_score, None)
-
-    async def evaluate(self, text: str) -> EvaluationResult:
-        """Asynchronous wrapper to offload CPU-bound string analysis to a background thread."""
-        return await asyncio.to_thread(self._sync_evaluate, text)
-
-
-class HeuristicExtractor:
-    """
-    Thread-Isolated Layout Stripper.
-    Executes DOM layout stripping and markdown generation using trafilatura logic.
-    """
-
-    def _sync_extract(self, html_payload: bytes) -> Optional[str]:
-        """Synchronous CPU-bound DOM traversal and boilerplate removal."""
-        try:
-            extracted_text = trafilatura.extract(
-                html_payload,
-                include_comments=False,
-                include_tables=True,
-                include_links=True,
-                format="markdown",
-                no_fallback=False
-            )
-            return extracted_text
-        except Exception as e:
-            logger.error(f"Catastrophic failure during heuristic DOM extraction: {str(e)}")
-            return None
-
-    async def extract_text(self, html_payload: bytes) -> Optional[str]:
-        """Asynchronous wrapper protecting the main event loop from CPU-bound parsing pauses."""
-        return await asyncio.to_thread(self._sync_extract, html_payload)
-
-
-class WebHarvester:
-    """
-    Asynchronous Protected Content Harvester.
-    Implements malicious asset shielding, strict limits, and parallel stream execution.
-    """
-
-    def __init__(self, max_concurrent_streams: int = 10, max_content_length: int = 10 * 1024 * 1024) -> None:
-        self.max_content_length: int = max_content_length
-        self._semaphore: asyncio.Semaphore = asyncio.Semaphore(max_concurrent_streams)
-        
-        self.allowed_content_types: Set[str] = {
-            "text/html",
-            "text/plain",
-            "text/markdown",
-            "application/xhtml+xml"
+        # 1. Map file extensions to Tree-sitter language identifiers
+        self.code_extensions = {
+            '.py': 'python',
+            '.js': 'javascript',
+            '.jsx': 'javascript',
+            '.ts': 'typescript',
+            '.tsx': 'tsx',
+            '.rs': 'rust',
+            '.go': 'go',
+            '.cpp': 'cpp',
+            '.c': 'c',
+            '.java': 'java',
+            '.cs': 'c_sharp',
+            '.rb': 'ruby'
         }
         
-        self.user_agent: str = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 (Alexandria-Vault/1.0)"
-        )
-        self.timeout = httpx.Timeout(15.0, connect=5.0)
-        self.limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+        # 2. Define supported documentation extensions
+        self.doc_extensions = {'.md', '.mdx', '.txt', '.rst'}
 
-    def _is_valid_content_type(self, content_type_header: str) -> bool:
-        """Evaluates HTTP Content-Type headers against the approved safelist."""
-        if not content_type_header:
-            return False
-        base_type = content_type_header.split(";")[0].strip().lower()
-        return base_type in self.allowed_content_types
-
-    async def _fetch_single_url(self, client: httpx.AsyncClient, url: str) -> Optional[bytes]:
+    def process_file(self, file_path: str, content: str) -> List[Dict[str, Any]]:
         """
-        Executes an isolated stream request, intercepting headers to prevent zip bombs
-        and unreadable binary streams from allocating into system memory.
+        Main dispatcher: routes the content based on file extension.
         """
-        async with self._semaphore:
-            try:
-                # Stream the response to intercept headers before pulling the payload body
-                async with client.stream("GET", url, follow_redirects=True) as response:
-                    response.raise_for_status()
+        path = pathlib.Path(file_path)
+        ext = path.suffix.lower()
 
-                    content_type = response.headers.get("Content-Type", "")
-                    if not self._is_valid_content_type(content_type):
-                        logger.warning(f"Rejected {url} due to invalid Content-Type: {content_type}")
-                        return None
+        logger.info(f"Routing document: {file_path} (Extension: {ext})")
 
-                    content_length_str = response.headers.get("Content-Length")
-                    if content_length_str and content_length_str.isdigit():
-                        if int(content_length_str) > self.max_content_length:
-                            logger.warning(f"Rejected {url} due to oversized Content-Length: {content_length_str} bytes")
-                            return None
-
-                    payload = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        payload.extend(chunk)
-                        if len(payload) > self.max_content_length:
-                            logger.warning(f"Rejected {url}: Stream exceeded dynamic allocation limit.")
-                            return None
-                    
-                    return bytes(payload)
-
-            except httpx.TooManyRedirects:
-                logger.error(f"Redirect loop detected for {url}. Connection dropped.")
-                return None
-            except httpx.TimeoutException:
-                logger.error(f"Connection timeout while streaming {url}.")
-                return None
-            except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP {e.response.status_code} returned for {url}.")
-                return None
-            except httpx.RequestError as e:
-                logger.error(f"Network transport error for {url}: {str(e)}")
-                return None
-            except Exception as e:
-                logger.error(f"Unexpected operational fault harvesting {url}: {str(e)}")
-                return None
-
-
-class ExtractionPipeline:
-    """
-    Master orchestrator for Phase 3.
-    Accepts pristine target URLs, marshals concurrent harvesting, executes heuristic 
-    extraction, calculates lexical density, and structures the final provenanced data layouts.
-    """
-
-    def __init__(self) -> None:
-        self.harvester = WebHarvester()
-        self.extractor = HeuristicExtractor()
-        self.evaluator = DensityEvaluator()
-
-    def _generate_manifest(self, url: str, text: str) -> ProvenanceManifest:
-        """
-        Constructs the strict cryptographic manifest linking Phase 3 extraction back to Phase 1 storage.
-        """
-        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        # Fixed: Generates a deterministic hash from the URL layout to protect system idempotency
-        source_id = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        if ext in self.code_extensions and TREE_SITTER_AVAILABLE:
+            language_id = self.code_extensions[ext]
+            return self._chunk_code_ast(file_path, content, language_id)
         
-        # Fixed: Converts current time into millisecond-accurate Unix epoch integer values
-        epoch_timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-        return ProvenanceManifest(
-            source_id=source_id,
-            source_uri=url,
-            raw_text_hash=text_hash,
-            harvest_timestamp=epoch_timestamp,
-            total_nodes_generated=0,
-            raptor_compilation_state=False
-        )
-
-    async def _process_single_target(self, client: httpx.AsyncClient, url: str) -> Optional[ExtractedDocument]:
-        """Pipeline lane for a single URL: Fetch -> Extract -> Evaluate -> Manifest."""
-        raw_html = await self.harvester._fetch_single_url(client, url)
-        if not raw_html:
-            return None
-
-        extracted_text = await self.extractor.extract_text(raw_html)
-        if not extracted_text:
-            logger.warning(f"Heuristic extraction yielded no usable layout for {url}")
-            return None
-
-        evaluation = await self.evaluator.evaluate(extracted_text)
-        if not evaluation.is_valid:
-            logger.warning(f"Signal density evaluation failed for {url}. Reason: {evaluation.rejection_reason}")
-            return None
-
-        logger.info(f"Successfully processed {url} with signal score: {evaluation.signal_score:.2f}")
-        manifest = self._generate_manifest(url, extracted_text)
+        elif ext in self.doc_extensions:
+            return self._chunk_documentation(file_path, content)
         
-        return ExtractedDocument(
-            url=url,
-            markdown_content=extracted_text,
-            manifest=manifest
-        )
+        else:
+            return self._chunk_fallback(file_path, content)
 
-    async def execute_extraction(self, urls: List[str]) -> List[ExtractedDocument]:
+    def _chunk_code_ast(self, file_path: str, content: str, language_id: str) -> List[Dict[str, Any]]:
         """
-        Consumes an array of target URLs and processes them concurrently through the 
-        protected extraction boundaries. Returns validated ExtractedDocument objects.
+        The Code Route: Parses the code into an AST and extracts top-level and 
+        class-level constructs (functions, classes, methods).
         """
-        logger.info(f"Initializing extraction pipeline for {len(urls)} targets.")
-        headers = {"User-Agent": self.harvester.user_agent}
+        try:
+            parser = get_parser(language_id)
+            tree = parser.parse(content.encode('utf-8'))
+        except Exception as e:
+            logger.error(f"Failed to parse {file_path} with tree-sitter: {e}. Using fallback.")
+            return self._chunk_fallback(file_path, content)
+
+        chunks = []
+        lines = content.split('\n')
         
-        async with httpx.AsyncClient(
-            headers=headers,
-            timeout=self.harvester.timeout,
-            limits=self.harvester.limits,
-            max_redirects=4
-        ) as client:
-            tasks = [self._process_single_target(client, url) for url in urls]
-            results_nested = await asyncio.gather(*tasks, return_exceptions=True)
+        # We want to extract functions, classes, and methods. 
+        # Node types vary slightly by language, but these are standard general identifiers.
+        target_node_types = {
+            'function_definition', 'class_definition', 'method_definition', 
+            'function_declaration', 'class_declaration', 'method_declaration'
+        }
 
-        valid_documents: List[ExtractedDocument] = []
-        for res in results_nested:
-            if isinstance(res, Exception):
-                logger.critical(f"Critical execution escape caught at harvester parallel boundary: {str(res)}")
-            elif res is not None:
-                valid_documents.append(res)
+        def traverse(node):
+            if node.type in target_node_types:
+                start_line = node.start_point[0]
+                end_line = node.end_point[0]
+                
+                # Reconstruct the exact string for this node
+                node_content = '\n'.join(lines[start_line:end_line + 1])
+                
+                chunks.append({
+                    "content": node_content,
+                    "metadata": {
+                        "file_path": file_path,
+                        "chunk_type": "code_ast",
+                        "node_type": node.type,
+                        "start_line": start_line + 1,
+                        "end_line": end_line + 1,
+                        "language": language_id
+                    }
+                })
+            else:
+                for child in node.children:
+                    traverse(child)
 
-        logger.info(f"Extraction pipeline finalized. Yielded {len(valid_documents)} validated documents.")
-        return valid_documents
+        traverse(tree.root_node)
+
+        # If a file had no extractable functions/classes (e.g., a pure script or config),
+        # gracefully degrade to fallback so we don't lose the data.
+        if not chunks:
+            return self._chunk_fallback(file_path, content)
+
+        return chunks
+
+    def _chunk_documentation(self, file_path: str, content: str) -> List[Dict[str, Any]]:
+        """
+        The Documentation Route: Uses recursive Markdown splitting.
+        Looks for Header -> Double Newline -> Single Newline.
+        """
+        chunks = []
+        
+        # Split primarily by Markdown headers
+        sections = re.split(r'(^#+\s+.*)', content, flags=re.MULTILINE)
+        
+        current_section = sections[0].strip()
+        
+        for i in range(1, len(sections), 2):
+            header = sections[i].strip()
+            body = sections[i+1].strip() if i+1 < len(sections) else ""
+            
+            combined_content = f"{header}\n\n{body}".strip()
+            
+            if combined_content:
+                chunks.append({
+                    "content": combined_content,
+                    "metadata": {
+                        "file_path": file_path,
+                        "chunk_type": "markdown_section",
+                        "header": header
+                    }
+                })
+
+        # Add initial preamble if it exists before any headers
+        if current_section:
+            chunks.insert(0, {
+                "content": current_section,
+                "metadata": {
+                    "file_path": file_path,
+                    "chunk_type": "markdown_preamble",
+                    "header": "Preamble"
+                }
+            })
+
+        return chunks
+
+    def _chunk_fallback(self, file_path: str, content: str) -> List[Dict[str, Any]]:
+        """
+        The Fallback Route: Standard recursive character splitting.
+        Guarantees that large unsupported files won't overflow the LLM context.
+        """
+        chunks = []
+        start_idx = 0
+        text_length = len(content)
+
+        while start_idx < text_length:
+            end_idx = min(start_idx + self.fallback_chunk_size, text_length)
+            
+            # Try to snap to the nearest double newline to avoid cutting mid-sentence
+            if end_idx < text_length:
+                nearest_newline = content.rfind("\n\n", start_idx, end_idx)
+                if nearest_newline != -1 and nearest_newline > start_idx + (self.fallback_chunk_size // 2):
+                    end_idx = nearest_newline
+
+            chunk_text = content[start_idx:end_idx].strip()
+            if chunk_text:
+                chunks.append({
+                    "content": chunk_text,
+                    "metadata": {
+                        "file_path": file_path,
+                        "chunk_type": "fallback_character",
+                        "start_char": start_idx,
+                        "end_char": end_idx
+                    }
+                })
+            
+            # FIX: If we've reached the end of the file, break the loop to prevent infinite cycling
+            if end_idx >= text_length:
+                break
+            
+            start_idx = end_idx - self.fallback_overlap
+
+        return chunks
+# Example usage for local testing
+if __name__ == "__main__":
+    chunker = RoutingChunker()
+    # Replace with an actual read of a file
+    # sample_chunks = chunker.process_file("example.py", "def my_func():\n    pass\n")
+    # print(sample_chunks)
