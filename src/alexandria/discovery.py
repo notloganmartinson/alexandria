@@ -1,17 +1,17 @@
 # src/alexandria/discovery.py
 import asyncio
-import json
 import logging
 import re
 import urllib.parse
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict
 
-import httpx
+# SOTA Zero-Config Web Scraping & Discovery
+from duckduckgo_search import DDGS
+from crawl4ai import AsyncWebCrawler
 
-# Conforms to library logging standard (delegates handlers to the top-level application)
+# Conforms to library logging standard (delegates handlers to the top-level application)[cite: 2]
 logger = logging.getLogger("alexandria.discovery")
-
 
 @dataclass(frozen=True)
 class SearchResult:
@@ -21,13 +21,11 @@ class SearchResult:
     snippet: str
     score: float = 0.0
 
-
 @dataclass(frozen=True)
 class SubQueryCollection:
     """Encapsulates a parent topic partitioned into a localized sub-query array."""
     master_topic: str
     sub_queries: List[str]
-
 
 class ResultSifter:
     """
@@ -35,7 +33,6 @@ class ResultSifter:
     Responsible for normalizing tracking strings, path canonicalization, query parameter 
     sorting, and executing domain pattern blocklists.
     """
-
     def __init__(self) -> None:
         self.tracking_params: set[str] = {
             "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
@@ -65,31 +62,28 @@ class ResultSifter:
             parsed = urllib.parse.urlparse(raw_url)
             if not parsed.scheme or not parsed.netloc:
                 return None
-
             scheme = parsed.scheme.lower()
             if scheme not in ("http", "https"):
                 return None
-
             netloc = parsed.netloc.lower()
             if netloc.startswith("www."):
                 netloc = netloc[4:]
-
-            # Path Canonicalization: Strip trailing slashes to catch directory structure duplicates
+            
+            # Path Canonicalization: Strip trailing slashes to catch directory structure duplicates[cite: 2]
             path = parsed.path
             if path and path != "/":
                 path = path.rstrip("/")
-
-            # Extract and sanitize query strings
+            
+            # Extract and sanitize query strings[cite: 2]
             query_dict = urllib.parse.parse_qs(parsed.query)
             filtered_query = {
                 k: v for k, v in query_dict.items()
                 if k.lower() not in self.tracking_params
             }
             
-            # Deterministic Query Parameter Sorting to avoid permutation bypasses
+            # Deterministic Query Parameter Sorting to avoid permutation bypasses[cite: 2]
             sorted_query = sorted(filtered_query.items())
             new_query = urllib.parse.urlencode(sorted_query, doseq=True)
-
             return urllib.parse.urlunparse((scheme, netloc, path, parsed.params, new_query, ""))
         except ValueError as e:
             logger.warning(f"Value parsing collision encountered for string {raw_url}: {str(e)}")
@@ -106,14 +100,11 @@ class ResultSifter:
         try:
             parsed = urllib.parse.urlparse(url)
             netloc = parsed.netloc.lower()
-
             if any(blacklisted in netloc for blacklisted in self.domain_blacklist):
                 return False
-
             for pattern in self.low_signal_patterns:
                 if pattern.search(url):
                     return False
-
             return True
         except Exception as e:
             logger.error(f"Heuristic validation loop crashed on target URL {url}: {str(e)}")
@@ -126,7 +117,6 @@ class ResultSifter:
         delivers an optimized array sorted by search ranking.
         """
         unique_topology: dict[str, SearchResult] = {}
-
         for result in raw_results:
             normalized_url = self.normalize_url(result.url)
             
@@ -155,131 +145,115 @@ class ResultSifter:
 
         return sorted(unique_topology.values(), key=lambda r: r.score, reverse=True)
 
-
-class SearXNGAggregator:
+class DDGAggregator:
     """
-    Resilient Concurrent SearXNG Proxy Aggregator.
-    Handles highly parallelized network connections bounded by async semaphores and 
-    strict request parameters to protect host system limits.
+    Zero-config Async DuckDuckGo Aggregator.
+    Replaces the brittle SearXNG proxy layer with direct, serverless DDG routing.
     """
+    def __init__(self, max_results_per_query: int = 8):
+        self.max_results_per_query = max_results_per_query
 
-    def __init__(
-        self, 
-        endpoint: str = "http://127.0.0.1:8081/search", 
-        timeout_seconds: float = 12.0,
-        max_concurrent_queries: int = 8
-    ) -> None:
-        self.endpoint: str = endpoint
-        self.timeout_seconds: float = timeout_seconds
-        # Enforces a strict operational boundary to prevent overloading local proxy sockets
-        self._semaphore: asyncio.Semaphore = asyncio.Semaphore(max_concurrent_queries)
-
-    async def _fetch_query(self, client: httpx.AsyncClient, query: str) -> List[SearchResult]:
-        """
-        Executes a localized search network transaction wrapped inside tight exception safety nets.
-        Isolates JSON serialization faults to explicitly identify proxy service failures.
-        """
-        params: dict[str, str] = {
-            "q": query,
-            "format": "json"
-        }
-        
-        async with self._semaphore:
-            try:
-                response = await client.get(self.endpoint, params=params)
-                response.raise_for_status()
+    def _fetch_query_sync(self, query: str) -> List[SearchResult]:
+        """Synchronous fetch wrapped in a thread to prevent event loop blocking."""
+        results = []
+        try:
+            with DDGS() as ddgs:
+                # The latest DDGS.text returns a list of dictionaries directly
+                raw_results = ddgs.text(query, max_results=self.max_results_per_query)
                 
-                # Isolated decoding boundary to catch HTML proxy faults (e.g., 502/504 text maps)
-                try:
-                    data = response.json()
-                except json.JSONDecodeError as json_err:
-                    logger.error(
-                        f"Failed to decode search response payload for query '{query}'. "
-                        f"The SearXNG proxy service likely experienced an upstream deadlock and returned HTML text. "
-                        f"Details: {str(json_err)}"
-                    )
-                    return []
-
-                results: List[SearchResult] = []
-                for item in data.get("results", []):
-                    url = item.get("url")
-                    title = item.get("title", "")
-                    snippet = item.get("content", "")
+                # Check if DDG returned None (rate-limit/empty results)
+                if not raw_results:
+                    return results
                     
-                    try:
-                        score = float(item.get("score", 0.0))
-                    except (TypeError, ValueError):
-                        score = 0.0
+                for r in raw_results:
+                    score = 1.0 - (len(results) * 0.05)
+                    results.append(SearchResult(
+                        url=r.get("href", ""),
+                        title=r.get("title", ""),
+                        snippet=r.get("body", ""),
+                        score=max(score, 0.1)
+                    ))
+        except Exception as e:
+            logger.error(f"DuckDuckGo fetch failed for query '{query}': {str(e)}")
+        return results
 
-                    if url:
-                        results.append(SearchResult(url=url, title=title, snippet=snippet, score=score))
-                        
-                return results
-
-            except httpx.TimeoutException:
-                logger.error(f"Network request connection timed out against SearXNG for query string: '{query}'")
-                return []
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Local SearXNG instance returned bad status code {e.response.status_code} for query: '{query}'")
-                return []
-            except httpx.RequestError as e:
-                logger.error(f"Transport connectivity mapping error connecting to search endpoint for query '{query}': {str(e)}")
-                return []
-            except Exception as e:
-                logger.error(f"Unexpected operational fault inside network task lane for query '{query}': {str(e)}")
-                return []
+    async def _fetch_query(self, query: str) -> List[SearchResult]:
+        """Offloads the blocking network call to a background thread."""
+        return await asyncio.to_thread(self._fetch_query_sync, query)
 
     async def execute_queries(self, queries: List[str]) -> List[SearchResult]:
-        """
-        Maps a collection of search vectors into parallel processing lanes, safely captures 
-        individual task yields, and aggregates them into a flat discovery record array.
-        """
-        timeout = httpx.Timeout(self.timeout_seconds)
-        limits = httpx.Limits(max_connections=120, max_keepalive_connections=40)
+        """Maps queries into parallel Async requests."""
+        tasks = [self._fetch_query(q) for q in queries]
+        results_nested = await asyncio.gather(*tasks, return_exceptions=True)
         
-        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-            tasks = [self._fetch_query(client, q) for q in queries]
-            # return_exceptions=True guards the outer orchestrator event loop from a catastrophic failure
-            results_nested = await asyncio.gather(*tasks, return_exceptions=True)
-
         flattened_results: List[SearchResult] = []
         for res in results_nested:
             if isinstance(res, list):
                 flattened_results.extend(res)
             elif isinstance(res, Exception):
-                logger.critical(f"Critical execution escape caught at parallel worker aggregation boundary: {str(res)}")
-
+                logger.critical(f"Critical execution escape in DDG aggregation: {str(res)}")
         return flattened_results
+
+class AsyncCrawler:
+    """
+    SOTA Markdown Extraction using Crawl4AI.
+    Bypasses Cloudflare, natively renders React/JS, and outputs mathematically clean Markdown.
+    """
+    async def extract_markdown(self, urls: List[str]) -> List[Dict[str, str]]:
+        extracted_data = []
+        async with AsyncWebCrawler() as crawler:
+            tasks = [crawler.arun(url=url) for url in urls]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for url, result in zip(urls, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Crawl4AI failed to extract {url}: {str(result)}")
+                    continue
+                
+                # Check for successful extraction and pure markdown presence
+                if result and hasattr(result, 'markdown') and result.markdown:
+                    extracted_data.append({
+                        "url": url,
+                        "markdown": result.markdown
+                    })
+        return extracted_data
 
 
 class DiscoveryEngine:
     """
     Sub-Query Dimensional Expansion Engine.
-    The primary orchestration entry point for Phase 2. Accepts multi-vector taxonomy 
-    targets, commands concurrent network proxy lookups, sweeps files via the sifter,
-    and exposes a collection of pristine destination targets.
+    Orchestrates DDG discovery, URL deduplication, and Crawl4AI Markdown extraction.
     """
-
-    def __init__(self, search_endpoint: str = "http://127.0.0.1:8081/search", timeout_seconds: float = 12.0) -> None:
-        self.aggregator: SearXNGAggregator = SearXNGAggregator(endpoint=search_endpoint, timeout_seconds=timeout_seconds)
+    def __init__(self, max_results_per_query: int = 8) -> None:
+        self.aggregator: DDGAggregator = DDGAggregator(max_results_per_query=max_results_per_query)
         self.sifter: ResultSifter = ResultSifter()
+        self.crawler: AsyncCrawler = AsyncCrawler()
 
     async def expand_and_discover(self, collection: SubQueryCollection) -> List[str]:
         """
-        Main orchestration loop executing the full Phase 2 discovery pipeline.
-        Returns a deduplicated list of optimized target URLs ready for extraction.
+        Phase 1: Discovery. 
+        Executes expanded queries and returns a deduplicated list of target URLs.
         """
         logger.info(f"Initiating dimensional query expansion for target topic: '{collection.master_topic}'")
         
-        # Merge master query and expansion queries into a single evaluation set
+        # Merge master query and expansion queries into a single evaluation set[cite: 2]
         all_queries = [collection.master_topic] + collection.sub_queries
-        # Cleanly deduplicate source search queries prior to launch to save proxy cycles
         unique_queries = list(dict.fromkeys(all_queries))
         
         raw_results = await self.aggregator.execute_queries(unique_queries)
         logger.info(f"Discovery aggregation complete. Captured {len(raw_results)} total raw impression hits.")
         
         cleaned_results = self.sifter.sift_and_deduplicate(raw_results)
-        logger.info(f"Sifting sequence finalized. Retained {len(cleaned_results)} unique, high-authority data link frameworks.")
+        logger.info(f"Sifting sequence finalized. Retained {len(cleaned_results)} unique, high-authority links.")
         
         return [result.url for result in cleaned_results]
+
+    async def scrape_payloads(self, urls: List[str]) -> List[Dict[str, str]]:
+        """
+        Phase 2: Extraction.
+        Consumes URLs and returns structured dictionaries of source URLs and clean Markdown.
+        """
+        logger.info(f"Executing Crawl4AI sequence against {len(urls)} validated targets.")
+        payloads = await self.crawler.extract_markdown(urls)
+        logger.info(f"Extraction sequence complete. Successfully rendered {len(payloads)} Markdown payloads.")
+        return payloads

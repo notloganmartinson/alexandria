@@ -8,6 +8,9 @@ class LocalEmbedder:
         print(f"[*] Loading local embedding model: {model_name}...")
         # trust_remote_code=True is strictly required for Nomic's custom architecture
         self.model = SentenceTransformer(model_name, trust_remote_code=True)
+
+        self.dimension = self.model.get_embedding_dimension()
+
         print("[+] Embedding model loaded into memory.")
         
     def _sync_embed(self, texts: List[str], task_type: str) -> List[List[float]]:

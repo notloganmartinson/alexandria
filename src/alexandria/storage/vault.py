@@ -1,120 +1,149 @@
+# src/alexandria/storage/vault.py
 import os
-import pickle
 import asyncio
+from typing import List, Dict, Any
+
 import lancedb
-import networkx as nx
-from typing import List, Dict, Any, Optional
-from alexandria.storage.schemas import IngestionDocumentRecord
+import pandas as pd
+
+from alexandria.storage.schemas import (
+    create_document_schema, 
+    create_entity_schema, 
+    create_community_schema, 
+    GraphEdgeRecord
+)
+from alexandria.graph.matrix import PPRMatrixEngine
+from alexandria.embedder import LocalEmbedder
 
 class AlexandriaVault:
     """
-    Frontier-grade Hybrid RAG Vault.
-    Maintains concurrent async transaction boundaries for LanceDB vector spaces 
-    and a local NetworkX Directed Graph.
+    Decoupled Production Storage Layer.
+    Executes O(1) canonicalization via Vector ANN and manages LanceDB I/O.
     """
-    def __init__(self, storage_path: str = "./.alexandria_vault"):
+    def __init__(self, embedder: LocalEmbedder, storage_path: str = "./.alexandria_vault", vector_dim: int = 768):
         self.storage_path = storage_path
+        self.vector_dim = vector_dim
+        self.embedder = embedder
         os.makedirs(self.storage_path, exist_ok=True)
         
-        # Async synchronization primitives to protect concurrent operations
         self._lock = asyncio.Lock()
         
-        # Initialize Vector Store
         self.db = lancedb.connect(os.path.join(self.storage_path, "lancedb"))
-        self.table_name = "vault_records"
+        self._init_tables()
         
-        # Initialize LanceDB table directly from our Pydantic LanceModel
-        # This automatically handles the 384-dimensional vector field definition
-        if self.table_name not in self.db.table_names():
-            self.table = self.db.create_table(self.table_name, schema=IngestionDocumentRecord)
-        else:
-            self.table = self.db.open_table(self.table_name)
+        self.matrix_engine = PPRMatrixEngine()
+        self._hydrate_matrix()
+
+    def _init_tables(self):
+        doc_schema = create_document_schema(self.vector_dim)
+        ent_schema = create_entity_schema(self.vector_dim)
+        comm_schema = create_community_schema(self.vector_dim)
+        
+        self.table = self.db.create_table("vault_records", schema=doc_schema, exist_ok=True)
+        self.edges_table = self.db.create_table("vault_edges", schema=GraphEdgeRecord, exist_ok=True)
+        self.entities_table = self.db.create_table("vault_entities", schema=ent_schema, exist_ok=True)
+        self.communities_table = self.db.create_table("vault_communities", schema=comm_schema, exist_ok=True)
+
+    def _hydrate_matrix(self):
+        """Builds the Scipy Sparse Matrix into RAM on boot."""
+        df = self.edges_table.to_pandas()
+        self.matrix_engine.rebuild(df)
+
+    async def _canonicalize_entities(self, raw_names: List[str], distance_threshold: float = 0.15) -> Dict[str, str]:
+        """
+        Replaces RapidFuzz with Sub-Millisecond Dense Vector ANN.
+        Distance threshold 0.15 roughly corresponds to 0.85 Cosine Similarity.
+        """
+        unique_names = list(set([n.strip() for n in raw_names if n.strip()]))
+        if not unique_names:
+            return {}
             
-        # Initialize Directed Knowledge Graph
-        self.graph_path = os.path.join(self.storage_path, "knowledge_graph.gpickle")
-        self._load_graph()
-
-    def _load_graph(self):
-        if os.path.exists(self.graph_path):
-            with open(self.graph_path, 'rb') as f:
-                self.graph = pickle.load(f)
-        else:
-            self.graph = nx.DiGraph()
-
-    def _sync_save_graph(self):
-        with open(self.graph_path, 'wb') as f:
-            pickle.dump(self.graph, f)
+        embeddings = await self.embedder.embed_batch(unique_names, task_type="query")
+        mapping = {}
+        new_entities = []
+        
+        # We query LanceDB for each entity to find the nearest canonical match
+        for name, vec in zip(unique_names, embeddings):
+            try:
+                hits = self.entities_table.search(vec).limit(1).to_list()
+                if hits and hits[0]["_distance"] < distance_threshold:
+                    mapping[name] = hits[0]["name"]
+                else:
+                    mapping[name] = name
+                    new_entities.append({"name": name, "vector": vec})
+            except Exception:
+                # Triggers if the table is empty
+                mapping[name] = name
+                new_entities.append({"name": name, "vector": vec})
+                
+        # Batch insert newly discovered entities
+        if new_entities:
+            self.entities_table.add(new_entities)
+            
+        return mapping
 
     async def write_records(self, records: List[Dict[str, Any]]) -> bool:
-        """
-        Thread-safe ingestion pipeline. 
-        Accepts records matching the IngestionDocumentRecord LanceModel schema.
-        """
+        """Thread-safe fast ingestion. Deliberately skips FTS Indexing to prevent I/O blocking."""
         async with self._lock:
             try:
                 if not records:
                     return True
-                    
-                # 1. Update LanceDB Vector Storage
-                self.table.add(records)
                 
-                # 2. Extract and link graph nodes
+                # Extract all unique entity names for batch canonicalization
+                all_raw_ents = []
+                for r in records:
+                    for rel in r.get("relations", []):
+                        all_raw_ents.extend([
+                            rel["source"] if isinstance(rel, dict) else rel.source,
+                            rel["target"] if isinstance(rel, dict) else rel.target
+                        ])
+                        
+                canonical_map = await self._canonicalize_entities(all_raw_ents)
+                
+                edge_records = []
                 for record in records:
                     chunk_id = record["chunk_id"]
-                    relations = record.get("relations", [])
-                    
-                    for rel in relations:
-                        # Handle both dict configurations and raw Pydantic schemas dynamically
-                        src = rel["source"] if isinstance(rel, dict) else rel.source
-                        tgt = rel["target"] if isinstance(rel, dict) else rel.target
+                    for rel in record.get("relations", []):
+                        raw_src = rel["source"] if isinstance(rel, dict) else rel.source
+                        raw_tgt = rel["target"] if isinstance(rel, dict) else rel.target
                         edge_type = rel["relation"] if isinstance(rel, dict) else rel.relation
                         
-                        if not self.graph.has_node(src):
-                            self.graph.add_node(src, source_chunks=set())
-                        self.graph.nodes[src]["source_chunks"].add(chunk_id)
+                        edge_records.append({
+                            "source": canonical_map[raw_src],
+                            "target": canonical_map[raw_tgt],
+                            "relation": edge_type,
+                            "chunk_id": chunk_id
+                        })
                         
-                        if not self.graph.has_node(tgt):
-                            self.graph.add_node(tgt, source_chunks=set())
-                        self.graph.nodes[tgt]["source_chunks"].add(chunk_id)
-                        
-                        self.graph.add_edge(src, tgt, relation=edge_type)
-                        
-                await asyncio.to_thread(self._sync_save_graph) 
+                # Batch Insertions
+                self.table.add(records)
+                if edge_records:
+                    self.edges_table.add(edge_records)
+                    # Non-blocking trigger to update matrix mapping
+                    asyncio.create_task(asyncio.to_thread(self._hydrate_matrix))
+                    
                 return True
             except Exception as e:
                 print(f"Ingestion Error: {e}")
                 return False
 
-    async def hybrid_vector_search(self, query_vector: List[float], top_k: int = 15) -> List[Dict[str, Any]]:
-        """Executes a thread-safe dense vector semantic distance check."""
+    async def hybrid_vector_search(self, query_vector: List[float], top_k: int = 15) -> List[str]:
         async with self._lock:
-            return self.table.search(query_vector).limit(top_k).to_list()
+            results = self.table.search(query_vector).limit(top_k).to_list()
+            return [res["chunk_id"] for res in results]
 
-    async def graph_traverse_search(self, seed_entities: List[str], max_depth: int = 2) -> List[str]:
-        """Executes multi-hop entity traversal to find highly connected chunk IDs."""
+    async def fts_search(self, query: str, top_k: int = 15) -> List[str]:
         async with self._lock:
-            chunk_hits: Dict[str, float] = {}
-            
-            for entity in seed_entities:
-                if entity in self.graph:
-                    # Mentions explicitly present in query get immediate weight boost
-                    for cid in self.graph.nodes[entity].get("source_chunks", []):
-                        chunk_hits[cid] = chunk_hits.get(cid, 0.0) + 3.0
-                        
-                    # Graph structural hop neighborhood expansion traversal loop
-                    edges = nx.bfs_edges(self.graph, source=entity, depth_limit=max_depth)
-                    for u, v in edges:
-                        for cid in self.graph.nodes[v].get("source_chunks", []):
-                            chunk_hits[cid] = chunk_hits.get(cid, 0.0) + 1.0
-                            
-            sorted_chunks = sorted(chunk_hits.items(), key=lambda x: x[1], reverse=True)
-            return [chunk_id for chunk_id, _ in sorted_chunks]
+            try:
+                results = self.table.search(query, query_type="fts").limit(top_k).to_list()
+                return [res["chunk_id"] for res in results]
+            except Exception:
+                return []
 
     async def get_chunks_by_ids(self, chunk_ids: List[str]) -> List[Dict[str, Any]]:
-        """Hydrates full text payloads matching high-ranked target IDs."""
         async with self._lock:
             if not chunk_ids:
                 return []
-            # Sanitization mapping for SQL statement formatting injection protection
-            ids_str = ", ".join([f"'{c}'" for c in chunk_ids])
+            sanitized = [c.replace("'", "''") for c in chunk_ids if isinstance(c, str)]
+            ids_str = ", ".join([f"'{c}'" for c in sanitized])
             return self.table.search().where(f"chunk_id IN ({ids_str})").to_list()

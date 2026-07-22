@@ -1,23 +1,22 @@
 import asyncio
-import json
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
 
 from alexandria.discovery import (
+    AsyncCrawler,
+    DDGAggregator,
     DiscoveryEngine,
     ResultSifter,
     SearchResult,
-    SearXNGAggregator,
     SubQueryCollection,
 )
 
 
 def test_normalize_url_trailing_slashes_and_domains():
     sifter = ResultSifter()
-    
+
     # Assert trailing slashes are stripped and domain is lowercased
     url = "HTTPS://WWW.EXAMPLE.COM/path/to/resource/"
     expected = "https://example.com/path/to/resource"
@@ -36,14 +35,14 @@ def test_normalize_url_trailing_slashes_and_domains():
 
 def test_normalize_url_parameter_sorting():
     sifter = ResultSifter()
-    
+
     # Assert identical URLs with varying query parameter layouts sort to the same canonical key
     url_a = "https://example.com/api?b=2&a=1&c=3"
     url_b = "https://example.com/api?c=3&b=2&a=1"
-    
+
     normalized_a = sifter.normalize_url(url_a)
     normalized_b = sifter.normalize_url(url_b)
-    
+
     expected = "https://example.com/api?a=1&b=2&c=3"
     assert normalized_a == expected
     assert normalized_b == expected
@@ -52,7 +51,7 @@ def test_normalize_url_parameter_sorting():
 
 def test_is_valid_authority_logic():
     sifter = ResultSifter()
-    
+
     # Valid domains
     assert sifter.is_valid_authority("https://en.wikipedia.org/wiki/Python") is True
     assert sifter.is_valid_authority("https://arxiv.org/abs/1234.5678") is True
@@ -71,108 +70,101 @@ def test_is_valid_authority_logic():
 
 def test_sift_and_deduplicate_scores():
     sifter = ResultSifter()
-    
+
     # Multiple SearchResult objects pointing to the same normalized URL
     raw_results = [
         SearchResult(url="https://example.com/article/?utm_source=1", title="Title A", snippet="Snippet A", score=0.5),
         SearchResult(url="https://example.com/article", title="Title B", snippet="Snippet B", score=0.9),
         SearchResult(url="https://EXAMPLE.com/article/", title="Title C", snippet="Snippet C", score=0.7),
-        SearchResult(url="https://valid.com/other", title="Other", snippet="Other Snippet", score=0.8)
+        SearchResult(url="https://valid.com/other", title="Other", snippet="Other Snippet", score=0.8),
     ]
-    
+
     deduplicated = sifter.sift_and_deduplicate(raw_results)
-    
+
     # We should have exactly two results
     assert len(deduplicated) == 2
-    
+
     # They should be sorted by score descending (0.9, then 0.8)
     assert deduplicated[0].score == 0.9
     assert deduplicated[0].url == "https://example.com/article"
     assert deduplicated[0].title == "Title B"
-    
+
     assert deduplicated[1].score == 0.8
     assert deduplicated[1].url == "https://valid.com/other"
 
 
 @pytest.mark.asyncio
-@patch("httpx.AsyncClient.get")
-async def test_aggregator_json_decode_error(mock_get, caplog):
-    # Setup the mock response to simulate a 502 returning HTML instead of JSON
-    mock_response = MagicMock()
-    mock_response.raise_for_status.return_value = None
-    # Force json() to raise JSONDecodeError
-    mock_response.json.side_effect = json.JSONDecodeError("Expecting value", "<html>502 Bad Gateway</html>", 0)
-    mock_get.return_value = mock_response
+@patch("alexandria.discovery.DDGS")
+async def test_ddg_aggregator_error_handling(mock_ddgs, caplog):
+    # Setup mock to raise an exception during DDG search to test fault tolerance
+    mock_instance = MagicMock()
+    mock_instance.text.side_effect = Exception("DDG blocked the request")
 
-    aggregator = SearXNGAggregator(max_concurrent_queries=1)
-    
+    # Synchronous context manager mocking for 'with DDGS() as ddgs:'
+    mock_ddgs.return_value.__enter__.return_value = mock_instance
+
+    aggregator = DDGAggregator()
+
     with caplog.at_level(logging.ERROR):
         results = await aggregator.execute_queries(["test query"])
-        
-    # Assert that the error is isolated, logged, and returns an empty list gracefully
+
+    # Assert that errors are caught, logged, and an empty list is gracefully returned
     assert results == []
-    assert "Failed to decode search response payload" in caplog.text
-    assert "test query" in caplog.text
-
+    assert "DuckDuckGo fetch failed" in caplog.text
 
 @pytest.mark.asyncio
-@patch("httpx.AsyncClient.get")
-async def test_aggregator_network_errors(mock_get, caplog):
-    aggregator = SearXNGAggregator(max_concurrent_queries=2)
-
-    # 1. Mock TimeoutException
-    mock_get.side_effect = httpx.TimeoutException("Connection timed out")
+@patch("alexandria.discovery.AsyncWebCrawler")
+async def test_async_crawler_error_handling(mock_crawler, caplog):
+    # Setup mock to raise an exception during URL extraction (e.g., Cloudflare block)
+    mock_instance = MagicMock()
     
+    # FIX: Use AsyncMock so the exception is raised during 'await', not during task creation
+    mock_instance.arun = AsyncMock(side_effect=Exception("Cloudflare blocked crawler"))
+
+    mock_crawler.return_value.__aenter__.return_value = mock_instance
+
+    crawler = AsyncCrawler()
+
     with caplog.at_level(logging.ERROR):
-        results_timeout = await aggregator.execute_queries(["timeout query"])
-    
-    assert results_timeout == []
-    assert "Network request connection timed out" in caplog.text
+        results = await crawler.extract_markdown(["https://example.com"])
 
-    # 2. Mock RequestError
-    caplog.clear()
-    mock_get.side_effect = httpx.RequestError("Host unreachable", request=MagicMock())
-    
-    with caplog.at_level(logging.ERROR):
-        results_request_err = await aggregator.execute_queries(["request err query"])
-        
-    assert results_request_err == []
-    assert "Transport connectivity mapping error" in caplog.text
-
-    # 3. Mock HTTPStatusError
-    caplog.clear()
-    mock_response = MagicMock()
-    mock_response.status_code = 500
-    mock_get.side_effect = httpx.HTTPStatusError("500 Server Error", request=MagicMock(), response=mock_response)
-    
-    with caplog.at_level(logging.ERROR):
-        results_status_err = await aggregator.execute_queries(["status err query"])
-        
-    assert results_status_err == []
-    assert "bad status code 500" in caplog.text
-
+    assert results == []
+    assert "Crawl4AI failed to extract" in caplog.text
 
 @pytest.mark.asyncio
-@patch("alexandria.discovery.SearXNGAggregator.execute_queries")
-async def test_discovery_engine_orchestration(mock_execute_queries):
-    # Setup mock aggregator response with a valid tracking parameter (utm_source)
+@patch("alexandria.discovery.AsyncCrawler.extract_markdown")
+@patch("alexandria.discovery.DDGAggregator.execute_queries")
+async def test_discovery_engine_orchestration(mock_execute_queries, mock_extract):
+    # Mock Phase 1: URL Discovery
     mock_execute_queries.return_value = [
         SearchResult(url="https://example.com/topic?utm_source=1", title="A", snippet="A", score=1.0),
         SearchResult(url="https://example.com/topic", title="B", snippet="B", score=2.0),
-        SearchResult(url="https://pinterest.com/pin/1", title="P", snippet="P", score=5.0) # Should be sifted out
+        SearchResult(url="https://pinterest.com/pin/1", title="P", snippet="P", score=5.0),  # Should be sifted out
     ]
-    
+
+    # Mock Phase 2: Markdown Extraction
+    mock_extract.return_value = [
+        {"url": "https://example.com/topic", "markdown": "# Topic Data"}
+    ]
+
     engine = DiscoveryEngine()
     collection = SubQueryCollection(
         master_topic="Artificial Intelligence",
-        sub_queries=["Machine Learning", "Neural Networks", "Artificial Intelligence"] # Duplicate sub-query
+        sub_queries=["Machine Learning", "Neural Networks", "Artificial Intelligence"],  # Duplicate sub-query
     )
-    
+
+    # Test Phase 1: Expansion
     final_urls = await engine.expand_and_discover(collection)
-    
+
     # Assert duplicate queries were merged before execution
     mock_execute_queries.assert_called_once_with(["Artificial Intelligence", "Machine Learning", "Neural Networks"])
-    
+
     # Assert exactly one pristine, deduplicated destination target is exposed
     assert len(final_urls) == 1
     assert final_urls[0] == "https://example.com/topic"
+
+    # Test Phase 2: Extraction
+    payloads = await engine.scrape_payloads(final_urls)
+    mock_extract.assert_called_once_with(["https://example.com/topic"])
+    assert len(payloads) == 1
+    assert payloads[0]["markdown"] == "# Topic Data"
